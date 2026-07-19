@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Scrapes TradingView's Options Chain page (±10 strikes, nearest expiration) for
-// each of FATTAH's six tickers, filters to ask <= $0.45, and writes the results
-// into fattah/detector/tracked_contracts.json's per-ticker candidates array.
+// Scrapes TradingView's Options Chain page (±10 strikes, nearest N expirations) for
+// each of FATTAH's six tickers, filters to ask <= $0.45, and appends the results
+// to fattah/detector/contract_store.jsonl (one line per discovered candidate,
+// stamped with discovered_at and run_id — never overwritten).
 //
 // Navigation follows the confirmed path from
 // ~/tradingview-mcp-jackson/skills/option-chain-navigate/SKILL.md: ticker badge
@@ -9,18 +10,49 @@
 // renders as a real <table>, so once there we read structured data/cell-id and
 // data-strike attributes instead of parsing pixel screenshots.
 //
+// Multi-expiration sweep (confirmed live 2026-07-19 on AAPL): the "Expiration"
+// toolbar button opens a checkbox list of upcoming dates (nearest first,
+// "Jul 20", "Jul 22", ... "Dec 18", ...). Exactly one (the nearest) is
+// pre-checked by default. Checking additional boxes is additive — the combined
+// chain groups rows under a "<Month Day>  N DTE" header per expiration and
+// keeps every previously-checked date's rows in the same table. Each cell's
+// data-cell-id already encodes the expiration (OPRA:{TICKER}{YYMMDD}{C|P}
+// {STRIKE}), so scraped rows never need the visible date-header text parsed.
+//
+// The combined table is virtualized (confirmed live: querying the DOM at
+// scrollTop=0 only returns ~2 expirations' worth of rows even with 4 dates
+// checked) — the scrape must scroll `.wrapper-*`'s scrollable ancestor in
+// small steps and merge rows across steps, waiting ~800ms per step for the
+// virtualized list to re-render. A single eval that sets scrollTop repeatedly
+// in one synchronous block does NOT work — confirmed live it never triggers a
+// re-render because the list needs to yield back to the event loop between
+// scroll positions.
+//
+// Concurrency: this script drives a single TradingView Desktop window over one
+// CDP connection with coordinate-based UI clicks (see connection.js — one
+// client, one target). Two tickers' navigation flows cannot safely interleave
+// against that one shared window, so "concurrent" here means the ticker loop
+// runs through a small concurrency-limiter (default concurrency=1, effectively
+// serialized) instead of a hardcoded for-loop, with independent per-ticker
+// error handling via Promise.allSettled. Passing --concurrency=N>1 is rejected
+// with a clear error rather than silently corrupting UI state.
+//
 // Usage:
-//   node scripts/fetch_option_chain.mjs               # all six tickers
-//   node scripts/fetch_option_chain.mjs AAPL MSFT      # subset
+//   node scripts/fetch_option_chain.mjs                     # all six tickers
+//   node scripts/fetch_option_chain.mjs AAPL MSFT           # subset
+//   node scripts/fetch_option_chain.mjs --concurrency=1 AAPL
 
-import { readFileSync, writeFileSync } from 'fs';
+import { appendFileSync, mkdirSync } from 'fs';
+import { dirname } from 'path';
+import { randomUUID } from 'crypto';
 import { chart, ui } from '../src/core/index.js';
 import { disconnect } from '../src/connection.js';
 
 const TICKERS = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'IBIT', 'META'];
 const ENTRY_PRICE_CEILING = 0.45;
-const CONTRACTS_FILE = new URL(
-  '../../fattah/detector/tracked_contracts.json',
+const MAX_EXPIRATIONS_PER_TICKER = 4;
+const STORE_FILE = new URL(
+  '../../fattah/detector/contract_store.jsonl',
   import.meta.url
 ).pathname;
 
@@ -127,45 +159,179 @@ async function openOptionsChain(ticker) {
       await sleep(800);
     }
   }
+
+  await selectExpirations(ticker);
 }
 
-async function scrapeNearestExpiration(ticker) {
-  const result = await ui.uiEvaluate({
+// Opens the "Expiration" checkbox panel and checks the next
+// MAX_EXPIRATIONS_PER_TICKER - 1 nearest dates (index 0, the nearest
+// expiration, is already checked by default — confirmed live). Leaves every
+// selected date's rows merged into the same chain table.
+async function selectExpirations(ticker) {
+  const expirationBtn = await pollFindElement('Expiration', { preferTag: 'div', timeoutMs: 3000 });
+  if (!expirationBtn) {
+    console.warn(`${ticker}: "Expiration" control not found — falling back to nearest expiration only`);
+    return;
+  }
+  await ui.mouseClick({ x: expirationBtn.x + expirationBtn.width / 2, y: expirationBtn.y + expirationBtn.height / 2, button: 'left' });
+
+  const panelReady = await pollFindElement('Select all', { timeoutMs: 3000 });
+  if (!panelReady) {
+    console.warn(`${ticker}: expiration panel never rendered — falling back to nearest expiration only`);
+    return;
+  }
+  await sleep(300);
+
+  // Date rows read as short text spans like "Jul 24" (checkbox sits ~16px to
+  // the left of the row's container, confirmed live). The list is already
+  // sorted soonest-first, so index 0 is the pre-checked nearest expiration.
+  const rows = await ui.uiEvaluate({
     expression: `
       (function(){
-        var table = document.querySelector('table');
-        if (!table) return { error: 'no table found' };
-        var rows = Array.from(table.querySelectorAll('tr'));
-        var header = rows[1];
-        var headerCells = Array.from(header.children).map(function(c){ return c.textContent.trim(); });
-        var strikeIdx = headerCells.indexOf('Strike');
-        if (strikeIdx === -1) return { error: 'Strike column not found', headerCells: headerCells };
+        var spans = Array.from(document.querySelectorAll('span')).filter(function(e){
+          return /^[A-Z][a-z]{2} \\d{1,2}$/.test(e.textContent.trim()) && e.offsetParent !== null && e.children.length === 0;
+        });
+        var seen = {};
         var out = [];
-        for (var i = 2; i < rows.length; i++) {
-          var r = rows[i];
-          if (!r.hasAttribute('data-strike')) continue;
-          var cells = Array.from(r.children).map(function(c){ return c.textContent.trim(); });
-          var callCell = r.querySelector('[data-cell-part="call"]');
-          var putCell = r.querySelector('[data-cell-part="put"]');
-          out.push({
-            strike: r.getAttribute('data-strike'),
-            callSymbol: callCell ? callCell.getAttribute('data-cell-id') : null,
-            putSymbol: putCell ? putCell.getAttribute('data-cell-id') : null,
-            callAsk: cells[strikeIdx - 5],
-            callBid: cells[strikeIdx - 4],
-            putBid: cells[strikeIdx + 5],
-            putAsk: cells[strikeIdx + 6],
-          });
-        }
-        return { rows: out };
+        spans.forEach(function(e){
+          var t = e.textContent.trim();
+          if (seen[t]) return;
+          seen[t] = 1;
+          var btn = e.closest('[class*="button-"]');
+          var r = (btn || e).getBoundingClientRect();
+          out.push({ text: t, x: r.x, y: r.y, height: r.height });
+        });
+        return out;
       })()
     `,
   });
+  const dateRows = rows?.result || [];
+  if (dateRows.length === 0) {
+    console.warn(`${ticker}: no expiration rows discovered — falling back to nearest expiration only`);
+    await ui.mouseClick({ x: 900, y: 60, button: 'left' });
+    return;
+  }
+
+  const toCheck = dateRows.slice(1, MAX_EXPIRATIONS_PER_TICKER);
+  for (const row of toCheck) {
+    await ui.mouseClick({ x: row.x + 16, y: row.y + row.height / 2, button: 'left' });
+    await sleep(250);
+  }
+  await sleep(800);
+
+  // Close the panel by clicking a neutral point above the table — clicking
+  // the Expiration button again toggles it but its coordinates shift once
+  // the badge count text changes width, so a fixed off-panel point is safer.
+  await ui.mouseClick({ x: 900, y: 60, button: 'left' });
+  await sleep(300);
+}
+
+async function findScrollContainer() {
+  const result = await ui.uiEvaluate({
+    expression: `
+      (function(){
+        var all = Array.from(document.querySelectorAll('*'));
+        var candidates = all.filter(function(el){
+          return el.scrollHeight > el.clientHeight + 100 && el.clientHeight > 200 && el.clientHeight < 900;
+        });
+        if (candidates.length === 0) return null;
+        var el = candidates[0];
+        return { clientHeight: el.clientHeight, scrollHeight: el.scrollHeight };
+      })()
+    `,
+  });
+  return result?.result || null;
+}
+
+function scrapeVisibleRowsExpression() {
+  return `
+    (function(){
+      var table = document.querySelector('table');
+      if (!table) return { error: 'no table found' };
+      var rows = Array.from(table.querySelectorAll('tr'));
+      var header = rows[1];
+      var headerCells = Array.from(header.children).map(function(c){ return c.textContent.trim(); });
+      var strikeIdx = headerCells.indexOf('Strike');
+      if (strikeIdx === -1) return { error: 'Strike column not found', headerCells: headerCells };
+      var out = [];
+      for (var i = 2; i < rows.length; i++) {
+        var r = rows[i];
+        if (!r.hasAttribute('data-strike')) continue;
+        var cells = Array.from(r.children).map(function(c){ return c.textContent.trim(); });
+        var callCell = r.querySelector('[data-cell-part="call"]');
+        var putCell = r.querySelector('[data-cell-part="put"]');
+        out.push({
+          strike: r.getAttribute('data-strike'),
+          callSymbol: callCell ? callCell.getAttribute('data-cell-id') : null,
+          putSymbol: putCell ? putCell.getAttribute('data-cell-id') : null,
+          callAsk: cells[strikeIdx - 5],
+          callBid: cells[strikeIdx - 4],
+          putBid: cells[strikeIdx + 5],
+          putAsk: cells[strikeIdx + 6],
+        });
+      }
+      return { rows: out };
+    })()
+  `;
+}
+
+async function scrapeVisibleRows(ticker) {
+  const result = await ui.uiEvaluate({ expression: scrapeVisibleRowsExpression() });
   const parsed = result?.result;
   if (!parsed || parsed.error) {
     throw new Error(`${ticker}: chain scrape failed — ${parsed?.error || 'no result'}`);
   }
   return parsed.rows;
+}
+
+// The combined multi-expiration chain is virtualized — only a window of rows
+// around the current scroll position exists in the DOM at any moment
+// (confirmed live: scraping at scrollTop=0 with 4 expirations checked only
+// ever returns ~2 expirations' worth of rows). Scroll in small steps, waiting
+// for the virtualized list to re-render between each, and merge by symbol.
+async function scrapeAllExpirations(ticker) {
+  const merged = new Map();
+  const mergeRows = (rows) => {
+    for (const row of rows) {
+      const key = row.callSymbol || row.putSymbol || row.strike;
+      if (!merged.has(key)) merged.set(key, row);
+    }
+  };
+
+  const container = await findScrollContainer();
+  if (!container) {
+    // Single expiration selected (or panel discovery failed) — no scrolling
+    // needed, the whole table already fits.
+    mergeRows(await scrapeVisibleRows(ticker));
+    return Array.from(merged.values());
+  }
+
+  const maxScroll = container.scrollHeight - container.clientHeight;
+  const step = Math.max(1, Math.floor(container.clientHeight * 0.5));
+
+  let scrollTop = 0;
+  let iterations = 0;
+  const MAX_ITERATIONS = 20;
+  while (iterations < MAX_ITERATIONS) {
+    await ui.uiEvaluate({
+      expression: `
+        (function(){
+          var all = Array.from(document.querySelectorAll('*'));
+          var el = all.filter(function(e){ return e.scrollHeight > e.clientHeight + 100 && e.clientHeight > 200 && e.clientHeight < 900; })[0];
+          if (el) el.scrollTop = ${scrollTop};
+          return el ? el.scrollTop : null;
+        })()
+      `,
+    });
+    await sleep(800);
+    mergeRows(await scrapeVisibleRows(ticker));
+
+    if (scrollTop >= maxScroll) break;
+    scrollTop = Math.min(scrollTop + step, maxScroll);
+    iterations++;
+  }
+
+  return Array.from(merged.values());
 }
 
 function toNumber(text) {
@@ -182,6 +348,16 @@ function toNumber(text) {
 function toDlySymbol(oprSymbol) {
   if (!oprSymbol || !oprSymbol.startsWith('OPRA:')) return null;
   return 'OPRA_DLY:' + oprSymbol.slice('OPRA:'.length);
+}
+
+// Expiration date is embedded directly in the OPRA symbol (YYMMDD) — no need
+// to parse the visible "Jul 24" style UI labels for it.
+function expirationFromSymbol(oprSymbol, ticker) {
+  if (!oprSymbol) return null;
+  const match = oprSymbol.match(new RegExp(`^OPRA:${ticker}(\\d{2})(\\d{2})(\\d{2})[CP]`));
+  if (!match) return null;
+  const [, yy, mm, dd] = match;
+  return `20${yy}-${mm}-${dd}`;
 }
 
 function buildCandidates(ticker, rows) {
@@ -201,6 +377,7 @@ function buildCandidates(ticker, rows) {
         type: side === 'call' ? 'C' : 'P',
         bid,
         ask,
+        expiration: expirationFromSymbol(rawSymbol, ticker),
       });
     }
   }
@@ -210,36 +387,105 @@ function buildCandidates(ticker, rows) {
 async function fetchTicker(ticker) {
   console.log(`${ticker}: navigating to options chain...`);
   await openOptionsChain(ticker);
-  const rows = await scrapeNearestExpiration(ticker);
-  console.log(`${ticker}: scraped ${rows.length} strike rows`);
+  const rows = await scrapeAllExpirations(ticker);
+  console.log(`${ticker}: scraped ${rows.length} strike rows across up to ${MAX_EXPIRATIONS_PER_TICKER} expirations`);
   const candidates = buildCandidates(ticker, rows);
   console.log(`${ticker}: ${candidates.length} candidates <= $${ENTRY_PRICE_CEILING}`);
   return candidates;
 }
 
+// Minimal concurrency limiter. The ticker loop is expressed as a pool instead
+// of a hardcoded for-loop so per-ticker work is decoupled (Promise.allSettled,
+// independent timeouts/errors) and the pool size is a single knob — but it
+// defaults to (and, for now, only accepts) concurrency=1: this script drives
+// one shared TradingView Desktop window over one CDP connection with
+// coordinate-based clicks, and two tickers' navigation flows interleaving
+// against that single window would corrupt both (see connection.js — one
+// client, one target, no multiplexing). Raise this once multiple
+// windows/CDP connections are wired up.
+function createLimiter(concurrency) {
+  let active = 0;
+  const queue = [];
+  const runNext = () => {
+    if (active >= concurrency || queue.length === 0) return;
+    active++;
+    const { fn, resolve, reject } = queue.shift();
+    fn().then(resolve, reject).finally(() => {
+      active--;
+      runNext();
+    });
+  };
+  return (fn) => new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    runNext();
+  });
+}
+
+function appendToStore(runId, ticker, candidates) {
+  mkdirSync(dirname(STORE_FILE), { recursive: true });
+  const discoveredAt = new Date().toISOString();
+  const lines = candidates.map((c) => JSON.stringify({
+    run_id: runId,
+    discovered_at: discoveredAt,
+    ticker,
+    ...c,
+  }));
+  if (lines.length > 0) {
+    appendFileSync(STORE_FILE, lines.join('\n') + '\n');
+  }
+}
+
+function parseArgs(argv) {
+  let concurrency = 1;
+  const tickers = [];
+  for (const arg of argv) {
+    const concurrencyMatch = arg.match(/^--concurrency=(\d+)$/);
+    if (concurrencyMatch) {
+      concurrency = Number(concurrencyMatch[1]);
+      continue;
+    }
+    tickers.push(arg);
+  }
+  return { concurrency, tickers };
+}
+
 async function main() {
-  const requested = process.argv.slice(2);
+  const { concurrency, tickers: requested } = parseArgs(process.argv.slice(2));
+  if (concurrency > 1) {
+    throw new Error(
+      `--concurrency=${concurrency} is not supported: this script drives a single TradingView ` +
+      `Desktop window over one CDP connection with coordinate-based clicks, so ticker flows ` +
+      `cannot safely run in parallel against it. Use --concurrency=1 (default).`
+    );
+  }
+
   const tickers = requested.length > 0 ? requested : TICKERS;
   for (const t of tickers) {
     if (!TICKERS.includes(t)) throw new Error(`Unknown ticker "${t}" — expected one of ${TICKERS.join(', ')}`);
   }
 
-  const registry = JSON.parse(readFileSync(CONTRACTS_FILE, 'utf8'));
+  const runId = randomUUID();
+  const limit = createLimiter(concurrency);
   const failures = [];
 
-  for (const ticker of tickers) {
-    try {
+  const outcomes = await Promise.allSettled(
+    tickers.map((ticker) => limit(async () => {
       const candidates = await fetchTicker(ticker);
-      registry.tickers[ticker].candidates = candidates;
-    } catch (err) {
-      failures.push({ ticker, message: err.message });
-      console.error(`${ticker}: FAILED — ${err.message}`);
-    }
-  }
+      return { ticker, candidates };
+    }))
+  );
 
-  registry.generated_at = new Date().toISOString();
-  writeFileSync(CONTRACTS_FILE, JSON.stringify(registry, null, 2) + '\n');
-  console.log(`\nWrote ${CONTRACTS_FILE}`);
+  outcomes.forEach((outcome, i) => {
+    const ticker = tickers[i];
+    if (outcome.status === 'fulfilled') {
+      appendToStore(runId, ticker, outcome.value.candidates);
+    } else {
+      failures.push({ ticker, message: outcome.reason?.message || String(outcome.reason) });
+      console.error(`${ticker}: FAILED — ${outcome.reason?.message || outcome.reason}`);
+    }
+  });
+
+  console.log(`\nAppended run ${runId} to ${STORE_FILE}`);
 
   if (failures.length > 0) {
     console.error(`\n${failures.length} ticker(s) failed: ${failures.map((f) => f.ticker).join(', ')}`);
