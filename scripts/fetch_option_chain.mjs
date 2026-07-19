@@ -41,8 +41,9 @@
 //   node scripts/fetch_option_chain.mjs                     # all six tickers
 //   node scripts/fetch_option_chain.mjs AAPL MSFT           # subset
 //   node scripts/fetch_option_chain.mjs --concurrency=1 AAPL
+//   node scripts/fetch_option_chain.mjs --expirations=2 AAPL # nearest 2 dates only
 
-import { appendFileSync, mkdirSync } from 'fs';
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'fs';
 import { dirname } from 'path';
 import { randomUUID } from 'crypto';
 import { chart, ui } from '../src/core/index.js';
@@ -50,9 +51,18 @@ import { disconnect } from '../src/connection.js';
 
 const TICKERS = ['AAPL', 'MSFT', 'NVDA', 'TSLA', 'IBIT', 'META'];
 const ENTRY_PRICE_CEILING = 0.45;
-const MAX_EXPIRATIONS_PER_TICKER = 4;
+const DEFAULT_MAX_EXPIRATIONS_PER_TICKER = 4;
 const STORE_FILE = new URL(
   '../../fattah/detector/contract_store.jsonl',
+  import.meta.url
+).pathname;
+// fattah/detector/src/collect_multi_symbol.mjs reads this shape directly
+// ({ tickers: { TICKER: { candidates: [...] } } }, lowest-ask-per-ticker) to
+// pick which contract pane to open — it predates this rewrite and still
+// needs a plain "latest" snapshot, so this file is derived and overwritten
+// each run alongside (not instead of) the append-only store above.
+const LATEST_SNAPSHOT_FILE = new URL(
+  '../../fattah/detector/tracked_contracts.json',
   import.meta.url
 ).pathname;
 
@@ -121,7 +131,7 @@ async function backToChartIfOnChainPage() {
   }
 }
 
-async function openOptionsChain(ticker) {
+async function openOptionsChain(ticker, maxExpirations) {
   await backToChartIfOnChainPage();
   await chart.setSymbol({ symbol: ticker });
   await sleep(1500);
@@ -160,14 +170,14 @@ async function openOptionsChain(ticker) {
     }
   }
 
-  await selectExpirations(ticker);
+  await selectExpirations(ticker, maxExpirations);
 }
 
 // Opens the "Expiration" checkbox panel and checks the next
-// MAX_EXPIRATIONS_PER_TICKER - 1 nearest dates (index 0, the nearest
-// expiration, is already checked by default — confirmed live). Leaves every
-// selected date's rows merged into the same chain table.
-async function selectExpirations(ticker) {
+// maxExpirations - 1 nearest dates (index 0, the nearest expiration, is
+// already checked by default — confirmed live). Leaves every selected
+// date's rows merged into the same chain table.
+async function selectExpirations(ticker, maxExpirations) {
   const expirationBtn = await pollFindElement('Expiration', { preferTag: 'div', timeoutMs: 3000 });
   if (!expirationBtn) {
     console.warn(`${ticker}: "Expiration" control not found — falling back to nearest expiration only`);
@@ -212,7 +222,7 @@ async function selectExpirations(ticker) {
     return;
   }
 
-  const toCheck = dateRows.slice(1, MAX_EXPIRATIONS_PER_TICKER);
+  const toCheck = dateRows.slice(1, maxExpirations);
   for (const row of toCheck) {
     await ui.mouseClick({ x: row.x + 16, y: row.y + row.height / 2, button: 'left' });
     await sleep(250);
@@ -384,11 +394,11 @@ function buildCandidates(ticker, rows) {
   return candidates;
 }
 
-async function fetchTicker(ticker) {
+async function fetchTicker(ticker, maxExpirations) {
   console.log(`${ticker}: navigating to options chain...`);
-  await openOptionsChain(ticker);
+  await openOptionsChain(ticker, maxExpirations);
   const rows = await scrapeAllExpirations(ticker);
-  console.log(`${ticker}: scraped ${rows.length} strike rows across up to ${MAX_EXPIRATIONS_PER_TICKER} expirations`);
+  console.log(`${ticker}: scraped ${rows.length} strike rows across up to ${maxExpirations} expirations`);
   const candidates = buildCandidates(ticker, rows);
   console.log(`${ticker}: ${candidates.length} candidates <= $${ENTRY_PRICE_CEILING}`);
   return candidates;
@@ -435,8 +445,21 @@ function appendToStore(runId, ticker, candidates) {
   }
 }
 
+function writeLatestSnapshot(tickerCandidates) {
+  const existing = existsSync(LATEST_SNAPSHOT_FILE)
+    ? JSON.parse(readFileSync(LATEST_SNAPSHOT_FILE, 'utf8'))
+    : { tickers: {} };
+  const snapshot = { generated_at: new Date().toISOString(), tickers: existing.tickers || {} };
+  for (const [ticker, candidates] of Object.entries(tickerCandidates)) {
+    snapshot.tickers[ticker] = { candidates };
+  }
+  mkdirSync(dirname(LATEST_SNAPSHOT_FILE), { recursive: true });
+  writeFileSync(LATEST_SNAPSHOT_FILE, JSON.stringify(snapshot, null, 2) + '\n');
+}
+
 function parseArgs(argv) {
   let concurrency = 1;
+  let maxExpirations = DEFAULT_MAX_EXPIRATIONS_PER_TICKER;
   const tickers = [];
   for (const arg of argv) {
     const concurrencyMatch = arg.match(/^--concurrency=(\d+)$/);
@@ -444,19 +467,27 @@ function parseArgs(argv) {
       concurrency = Number(concurrencyMatch[1]);
       continue;
     }
+    const expirationsMatch = arg.match(/^--expirations=(\d+)$/);
+    if (expirationsMatch) {
+      maxExpirations = Number(expirationsMatch[1]);
+      continue;
+    }
     tickers.push(arg);
   }
-  return { concurrency, tickers };
+  return { concurrency, maxExpirations, tickers };
 }
 
 async function main() {
-  const { concurrency, tickers: requested } = parseArgs(process.argv.slice(2));
+  const { concurrency, maxExpirations, tickers: requested } = parseArgs(process.argv.slice(2));
   if (concurrency > 1) {
     throw new Error(
       `--concurrency=${concurrency} is not supported: this script drives a single TradingView ` +
       `Desktop window over one CDP connection with coordinate-based clicks, so ticker flows ` +
       `cannot safely run in parallel against it. Use --concurrency=1 (default).`
     );
+  }
+  if (maxExpirations < 1) {
+    throw new Error(`--expirations=${maxExpirations} must be at least 1`);
   }
 
   const tickers = requested.length > 0 ? requested : TICKERS;
@@ -470,22 +501,26 @@ async function main() {
 
   const outcomes = await Promise.allSettled(
     tickers.map((ticker) => limit(async () => {
-      const candidates = await fetchTicker(ticker);
+      const candidates = await fetchTicker(ticker, maxExpirations);
       return { ticker, candidates };
     }))
   );
 
+  const succeeded = {};
   outcomes.forEach((outcome, i) => {
     const ticker = tickers[i];
     if (outcome.status === 'fulfilled') {
       appendToStore(runId, ticker, outcome.value.candidates);
+      succeeded[ticker] = outcome.value.candidates;
     } else {
       failures.push({ ticker, message: outcome.reason?.message || String(outcome.reason) });
       console.error(`${ticker}: FAILED — ${outcome.reason?.message || outcome.reason}`);
     }
   });
 
+  writeLatestSnapshot(succeeded);
   console.log(`\nAppended run ${runId} to ${STORE_FILE}`);
+  console.log(`Updated latest snapshot at ${LATEST_SNAPSHOT_FILE}`);
 
   if (failures.length > 0) {
     console.error(`\n${failures.length} ticker(s) failed: ${failures.map((f) => f.ticker).join(', ')}`);
