@@ -1,6 +1,6 @@
 ---
 name: option-chain-navigate
-description: Navigate to a ticker's option chain, select a specific contract, open its own 1-minute intraday candlestick chart, and save a clean native screenshot. Use when the user wants option chain data or a specific contract's chart for one of the six tickers FATTAH tracks (AAPL, MSFT, NVDA, TSLA, IBIT, META).
+description: Navigate to any ticker's option chain, select any specific contract, look up its live price/quote/OHLCV, open its own 1-minute intraday candlestick chart, and save a clean native screenshot. Works for any optionable ticker, not just FATTAH's six tracked names. Use whenever the user asks for an option's price, chart, greeks, or chain data for any symbol.
 ---
 
 # Option Chain + Option Chart Navigation
@@ -35,6 +35,31 @@ free/unpaid TradingView plan and silently intercept clicks. Run the
 **Close Any Ad** snippet after every step, and if a click seems to have no
 effect, screenshot first — check for an overlay before assuming the automation
 is broken.
+
+## Quick Price/Data Lookup (any contract, no chart needed)
+
+If the ask is just "what's the price/bid/ask/greeks on {contract}" and not a
+chart or screenshot, skip the chain UI entirely — jump straight to the
+contract's symbol and read data tools directly. This works for any
+optionable ticker, not just FATTAH's six.
+
+```
+node src/cli/index.js symbol "OPRA:{TICKER}{YYMMDD}{C|P}{STRIKE}"
+node src/cli/index.js quote
+node src/cli/index.js ohlcv --summary
+```
+
+e.g. for the SPY Aug 15 '26 640 call: `OPRA:SPY260815C640`. See "Real Option
+Symbol Format" below for the exact format rules (2-digit Y/M/D, no leading
+zeros, plain decimal strike, no `_DLY` suffix). If the ticker/strike/expiry
+isn't already known, get it from the chain first (Steps 1-4 below) rather
+than guessing the OPRA symbol — a wrong guess silently resolves to "symbol
+doesn't exist" or, worse, a different nearby contract.
+
+**Caveat:** this shortcut is reliable for data (`quote`/`ohlcv`) but not for
+screenshots — see the rendering-desync warning under "Real Option Symbol
+Format." If a clean chart image is needed, use the full chain-UI path
+(Steps 1-8) instead.
 
 ## Step 1: Load the Ticker
 
@@ -269,8 +294,22 @@ step's UI unexpectedly reverts right after running this snippet, that's why
 its own text (e.g. find "Sign up. Get $250" and click only its neighboring
 close icon) instead of the broad sweep when precision matters.
 
-## The Six Tickers
+## Scope: Any Ticker, Not Just FATTAH's Six
 
-FATTAH tracks: **AAPL, MSFT, NVDA, TSLA, IBIT, META** — matches
-`fattah/data/{TICKER}/` in the main FATTAH repo. AAPL, META, and TSLA have
-been tested directly; the workflow should generalize to the other three.
+This workflow is ticker-agnostic — every step (chain navigation, contract
+selection, direct `OPRA:{TICKER}{YYMMDD}{C|P}{STRIKE}` symbol lookup,
+screenshotting) works for any optionable US equity/ETF symbol on TradingView,
+not only FATTAH's tracked list. Use it for a one-off price/chart lookup on
+any ticker the user names.
+
+FATTAH itself tracks six tickers for its own pipeline: **AAPL, MSFT, NVDA,
+TSLA, IBIT, META** — matches `fattah/data/{TICKER}/` in the main FATTAH repo,
+and is the default set `scripts/fetch_option_chain.mjs` sweeps when no
+tickers are passed on the command line. That script also now accepts any
+ticker explicitly, e.g. `node scripts/fetch_option_chain.mjs SPY`, for a
+one-off pull outside the tracked six — results for non-tracked tickers still
+land in the same `contract_store.jsonl`/`latest_snapshot.json`, so only pass
+extra tickers there if that's actually wanted; for a pure lookup (not meant
+to be persisted into FATTAH's store), use the manual chain-navigate steps or
+the direct-symbol shortcut instead. AAPL, META, and TSLA have been tested
+directly for the full chain-UI flow; it should generalize to any symbol.
