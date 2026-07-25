@@ -491,9 +491,6 @@ async function main() {
   }
 
   const tickers = requested.length > 0 ? requested : TICKERS;
-  for (const t of tickers) {
-    if (!TICKERS.includes(t)) throw new Error(`Unknown ticker "${t}" — expected one of ${TICKERS.join(', ')}`);
-  }
 
   const runId = randomUUID();
   const limit = createLimiter(concurrency);
